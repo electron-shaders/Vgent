@@ -15,6 +15,7 @@ from models.utils import resize_video
 
 MODEL_MAP = {
     "llava_video":    ("models.llavavideo", "lmms-lab/LLaVA-Video-7B-Qwen2"),
+    "lmms_eval_async_openai": ("models.lmms_eval_async_openai", ""),
     "qwenvl25_7b":    ("models.qwenvl", "Qwen/Qwen2.5-VL-7B-Instruct"),
     "qwenvl25_3b":    ("models.qwenvl", "Qwen/Qwen2.5-VL-3B-Instruct"),
     "qwenvl2_7b":     ("models.qwenvl", "Qwen/Qwen2-VL-7B-Instruct"),
