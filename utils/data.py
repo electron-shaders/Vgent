@@ -1,10 +1,10 @@
-import random
-import torch
-import os
 import json
-from pyarrow import parquet as pq
-import pysubs2
+import os
 import re
+
+import torch
+from pyarrow import parquet as pq
+
 
 def timestamp_to_seconds(timestamp):
     h, m, s = timestamp.split(':')

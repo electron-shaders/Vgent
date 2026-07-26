@@ -6,12 +6,13 @@ bypassing Vgent's CLI-only scripts (vgent_graph.py, vgent_rag.py)
 by interacting directly with the `Vgent` class and `utils`.
 """
 
+import argparse
 import os
 import pickle
-import torch
-import argparse
-import warnings
 import threading
+import warnings
+
+import torch
 
 # ---------------------------------------------------------------------------
 # Lazy-load Vgent internals
@@ -36,6 +37,31 @@ def _lazy_init_embeddings():
             _embedding_model = AutoModel.from_pretrained('BAAI/bge-large-en-v1.5')
             _embedding_model.eval()
 
+# Per-video build lock: prevents concurrent coroutines from building the same
+# graph twice when the same video appears in multiple requests.
+_jit_build_locks: dict[str, threading.Lock] = {}
+_jit_build_locks_meta = threading.Lock()
+
+
+def _get_jit_lock(key: str) -> threading.Lock:
+    with _jit_build_locks_meta:
+        if key not in _jit_build_locks:
+            _jit_build_locks[key] = threading.Lock()
+        return _jit_build_locks[key]
+
+def _build_vgent_graph(video_id, video_inputs, subtitles, graph_path):
+    with _get_jit_lock(video_id):
+        if os.path.exists(graph_path):
+            return None, None
+        else:
+            video_graph, entity_graph = _vgent_instance.construct_graph(video_inputs, subtitles)
+            with open(graph_path, 'wb') as f:
+                pickle.dump({"video_graph": video_graph, "entity_graph": entity_graph}, f)
+    return video_graph, entity_graph
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 def init_vgent_instance(model_name: str, task: str, openai_client=None, openai_model_version: str = None):
     """
     Initialize the singleton Vgent instance on the main thread.
@@ -64,15 +90,15 @@ def init_vgent_instance(model_name: str, task: str, openai_client=None, openai_m
 
         from utils.vgent import Vgent
 
-        # Ensure model_name matches a valid key in VGent's MODEL_MAP
+        # Ensure model_name matches a valid key in Vgent's MODEL_MAP
         valid_keys = [
             "llava_video", "lmms_eval_async_openai",
             "qwenvl25_7b", "qwenvl25_3b", "qwenvl2_7b", "qwenvl2_2b",
             "internvl25_2b", "longvu",
         ]
         if not any(k in model_name for k in valid_keys):
-            print(f"[vgent_adapter] Model '{model_name}' not in MODEL_MAP. Falling back to 'qwenvl25_7b'.")
-            model_name = "qwenvl25_7b"
+            print(f"[vgent_adapter] Model '{model_name}' not in MODEL_MAP. Falling back to 'lmms_eval_async_openai'.")
+            model_name = "lmms_eval_async_openai"
 
         if openai_client is not None:
             import models.lmms_eval_async_openai as _m
@@ -93,6 +119,7 @@ def init_vgent_instance(model_name: str, task: str, openai_client=None, openai_m
             model_name=model_name,
             chunk_size=64,
             task=task,
+            uniform_frame=450,
             n_retrieval=20,
             n_refine=5,
             total_pixels=16384,
@@ -101,84 +128,19 @@ def init_vgent_instance(model_name: str, task: str, openai_client=None, openai_m
         _vgent_instance = Vgent(args)
         return _vgent_instance
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def run_vgent_query(graph_dir: str, query: str, max_clips: int = 8) -> str:
+def run_vgent_query(video_id: str, query: str, video_path: str, output_dir: str, question: str, candidates: list[str], doc: dict, subtitle_path: str | None = None, model_name: str = "qwenvl25_7b", task: str = "custom") -> str:
     """
-    Run VGent text-based retrieval for one query.
+    Run Vgent text-based retrieval for one query.
     Extracts the textual context of the top-k clips from the pre-built graph.
-    """
-    from utils.retrieval import compute_text_similarity, allocate_node
-    
-    _lazy_init_embeddings()
-
-    # Vgent saves graphs as .pkl files.
-    pkl_file = None
-    if os.path.isfile(graph_dir):
-        pkl_file = graph_dir
-    elif os.path.isdir(graph_dir):
-        for f in os.listdir(graph_dir):
-            if f.endswith('.pkl'):
-                pkl_file = os.path.join(graph_dir, f)
-                break
-
-    if not pkl_file or not os.path.isfile(pkl_file):
-        return ""
-
-    try:
-        with open(pkl_file, 'rb') as f:
-            saved_graph = pickle.load(f)
-            video_graph = saved_graph["video_graph"]
-            entity_graph = saved_graph["entity_graph"]
-
-        args = argparse.Namespace(chunk_size=64, n_retrieval=max_clips, fps=1.0)
-        query_list = [query]
-
-        node_list = allocate_node(args, video_graph, entity_graph, query_list, _embedding_model, _embedding_tokenizer)
-        if not node_list:
-            return ""
-
-        key_list = []
-        for node_id in node_list:
-            node_data = video_graph.nodes[node_id]
-            desc = "; ".join(node_data.get('entities', [])) + "; " + \
-                   "; ".join(node_data.get('actions', [])) + "; " + \
-                   "; ".join(node_data.get('scenes', []))
-            if node_data.get('subtitles'):
-                desc += "; " + "; ".join(node_data.get('subtitles', []))
-            key_list.append(desc)
-
-        sims = compute_text_similarity(query_list, key_list, _embedding_model, _embedding_tokenizer, return_all=True)
-        sorted_indices = torch.argsort(torch.mean(sims, dim=0), descending=True)
-        top_nodes = [node_list[i] for i in sorted_indices][:max_clips]
-
-        context_parts = []
-        for node in top_nodes:
-            data = video_graph.nodes[node]
-            desc = f"[Clip {node}]"
-            entities = data.get('entities', [])
-            actions = data.get('actions', [])
-            scenes = data.get('scenes', [])
-            if entities: desc += f"\nEntities: {', '.join(entities)}"
-            if actions: desc += f"\nActions: {', '.join(actions)}"
-            if scenes: desc += f"\nScenes: {', '.join(scenes)}"
-            if data.get('subtitles'): desc += f"\nSubtitles: {', '.join(data.get('subtitles', []))}"
-            context_parts.append(desc)
-
-        return "\n\n".join(context_parts)
-    except Exception as exc:
-        warnings.warn(f"[vgent_adapter] Query failed: {exc}", RuntimeWarning, stacklevel=2)
-        return ""
-
-
-def build_graph_for_video(video_path: str, output_dir: str, model_name: str = "qwenvl25_7b", task: str = "custom") -> str:
-    """
-    Build a VGent knowledge graph on-the-fly by importing the core Vgent class.
     """
     vgent = init_vgent_instance(model_name, task)
     args = vgent.args
+    _lazy_init_embeddings()
+
+    prompt = f"Question: {question}\n"
+    prompt += "Options:\n"
+    for op in candidates:
+        prompt += f"{op}\n"
 
     raw_video, _, _, frame_idx, fps, video_inputs, size_list = vgent.load_video(video_path, args)
     if "llava_video" in args.model_name:
@@ -187,11 +149,40 @@ def build_graph_for_video(video_path: str, output_dir: str, model_name: str = "q
     if type(video_inputs) is not list:
         video_inputs = [video_inputs]
 
-    video_graph, entity_graph = vgent.construct_graph(video_inputs, subtitles=None)
+    if subtitle_path is not None:
+        from utils.data import get_subtitles
+        subtitles = get_subtitles(subtitle_path, None, None, None)
 
     os.makedirs(output_dir, exist_ok=True)
-    out_file = os.path.join(output_dir, "graph.pkl")
-    with open(out_file, 'wb') as f:
-        pickle.dump({"video_graph": video_graph, "entity_graph": entity_graph}, f)
+    graph_path = os.path.join(output_dir, "graph.pkl")
+    if os.path.exists(graph_path):
+        try:
+            with open(graph_path, 'rb') as f:
+                saved_graph = pickle.load(f)
+                video_graph = saved_graph["video_graph"]
+                entity_graph = saved_graph["entity_graph"]
+        except Exception:
+            video_graph, entity_graph = _build_vgent_graph(video_id, video_inputs, subtitles, graph_path)
+            if video_graph is None or entity_graph is None:
+                with open(graph_path, 'rb') as f:
+                    saved_graph = pickle.load(f)
+                    video_graph = saved_graph["video_graph"]
+                    entity_graph = saved_graph["entity_graph"]
+    else:
+        video_graph, entity_graph = _build_vgent_graph(video_id, video_inputs, subtitles, graph_path)
+        if video_graph is None or entity_graph is None:
+            with open(graph_path, 'rb') as f:
+                saved_graph = pickle.load(f)
+                video_graph = saved_graph["video_graph"]
+                entity_graph = saved_graph["entity_graph"]
 
-    return output_dir
+    try:
+        query_list, llm_info = vgent.extract_keywords(question, candidates, video_inputs)
+        retrieved_node_list = vgent.retrieve_nodes(question, query_list, video_inputs, candidates, video_graph, entity_graph, subtitles, llm_info)
+        refined_node_list, sql_check, check_result = vgent.refine_nodes(retrieved_node_list, question, llm_info, candidates, video_inputs, subtitles, size_list)
+        pred = vgent.aggregate_nodes(refined_node_list, llm_info, video_inputs, raw_video, size_list, subtitles, prompt, doc, video_graph, sql_check, check_result, fps)
+    except Exception as exc:
+        warnings.warn(f"[vgent_adapter] Query failed: {exc}", RuntimeWarning, stacklevel=2)
+        return ""
+
+    return pred

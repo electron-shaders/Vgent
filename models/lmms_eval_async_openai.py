@@ -1,5 +1,5 @@
 """
-lmms_eval_async_openai.py — VGent model backend that delegates to a vLLM
+lmms_eval_async_openai.py — Vgent model backend that delegates to a vLLM
 OpenAI-compatible server via AsyncOpenAI client.
 
 Drop-in replacement for models/qwenvl.py: exposes the same three callables
@@ -36,7 +36,7 @@ _api_key = None        # API key string
 
 
 def load_video(video_path, args):
-    """Load and resize video for VGent chunk processing."""
+    """Load and resize video for Vgent chunk processing."""
     raw_video, frame_idx, fps = fetch_video({"video": video_path, "fps": args.fps}, resize=False)
     video, fps = resize_video(
         raw_video,
@@ -157,10 +157,10 @@ def mllm_response(
     fps=None,
 ):
     """
-    Synchronous wrapper — VGent's graph builder is synchronous, so we run the
+    Synchronous wrapper — Vgent's graph builder is synchronous, so we run the
     coroutine with asyncio.run().  Because each call is independent and vLLM
     serves them concurrently via HTTP, this achieves the same throughput as
-    the async path while keeping VGent's synchronous call-sites unchanged.
+    the async path while keeping Vgent's synchronous call-sites unchanged.
     """
     try:
         return asyncio.run(_async_mllm_response(text, video, max_new_tokens))

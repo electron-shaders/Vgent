@@ -273,7 +273,7 @@ class Vgent():
                 except:
                     agg_info = None
             input_prompt = input_prompt + PRED_PROMPT + agg_info if agg_info is not None else input_prompt + PRED_PROMPT
-            if "qwenvl" in self.args.model_name:
+            if "qwenvl" in self.args.model_name or self.args.model_name == "lmms_eval_async_openai":
                 # qwenvl support dynamic resolution
                 video_segments = raw_video[0][indices]
                 if len(video_segments) == 0:
