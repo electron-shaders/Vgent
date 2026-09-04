@@ -5,12 +5,14 @@ OpenAI-compatible server via AsyncOpenAI client.
 Drop-in replacement for models/qwenvl.py: exposes the same three callables
 (load_video, load_model, mllm_response) consumed by utils/vgent.py.
 
-Graph construction calls (mllm_response) are routed through the AsyncOpenAI
-client that lmms-eval manages, so all requests share the same HTTP connection
-pool and benefit from vLLM's continuous-batching scheduler natively.
+Graph construction calls (mllm_response) are routed through a persistent
+AsyncOpenAI client configured by lmms-eval, so all requests share the same HTTP
+connection pool and benefit from vLLM's continuous-batching scheduler natively.
 """
 
 import asyncio
+import logging
+import threading
 
 import numpy as np
 import torch
@@ -24,15 +26,131 @@ from tenacity import (
     before_sleep_log,
 )
 import openai
-import logging
 
 _log = logging.getLogger(__name__)
 
-# Module-level references set by vgent_adapter.init_vgent_instance()
-openai_client = None   # openai.AsyncOpenAI instance (used only to read config)
-model_version = None   # e.g. "Qwen/Qwen3.5-4B"
-_base_url = None       # e.g. "http://localhost:8000/v1"
-_api_key = None        # API key string
+# The adapter configures one runtime for the evaluator process.  All Vgent
+# callers submit work to this loop, so the client, connection pool, and
+# semaphore are shared.
+_runtime = None
+_runtime_lock = threading.Lock()
+
+
+class _PersistentOpenAIRuntime:
+    """Own a persistent AsyncOpenAI client on a dedicated event-loop thread."""
+
+    def __init__(self, base_url, api_key, model, concurrency, timeout):
+        self.base_url = str(base_url)
+        self.api_key = api_key
+        self.model = model
+        self.concurrency = int(concurrency)
+        self.timeout = timeout
+        self._loop = asyncio.new_event_loop()
+        self._ready = threading.Event()
+        self._closed = False
+        self._startup_error = None
+        self._client = None
+        self._semaphore = None
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="vgent-openai-runtime",
+            daemon=True,
+        )
+        self._thread.start()
+        self._ready.wait()
+        if self._startup_error is not None:
+            raise RuntimeError("Failed to initialize the Vgent OpenAI runtime") from self._startup_error
+
+    @property
+    def config(self):
+        return (self.base_url, self.api_key, self.model, self.concurrency, self.timeout)
+
+    def _run_loop(self):
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._client = openai.AsyncOpenAI(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                timeout=self.timeout,
+            )
+            self._semaphore = asyncio.Semaphore(self.concurrency)
+        except BaseException as exc:
+            self._startup_error = exc
+        finally:
+            self._ready.set()
+
+        if self._startup_error is not None:
+            self._loop.close()
+            return
+
+        self._loop.run_forever()
+        self._loop.run_until_complete(self._client.close())
+        self._loop.close()
+
+    async def _call_api_with_retry(self, messages, max_new_tokens):
+        @retry(
+            retry=retry_if_exception_type((
+                openai.APIConnectionError,
+                openai.APITimeoutError,
+            )),
+            wait=wait_exponential(multiplier=1, min=2, max=60),
+            stop=stop_after_attempt(8),
+            before_sleep=before_sleep_log(_log, logging.WARNING),
+            reraise=True,
+        )
+        async def _do_call():
+            # Acquire for one HTTP attempt only.  Exceptions and cancellations
+            # release the permit before tenacity performs its retry backoff.
+            async with self._semaphore:
+                return await self._client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=max_new_tokens,
+                    temperature=0.0,
+                )
+
+        response = await _do_call()
+        return response.choices[0].message.content or ""
+
+    def request(self, messages, max_new_tokens):
+        if self._closed:
+            raise RuntimeError("The Vgent OpenAI runtime is closed")
+        future = asyncio.run_coroutine_threadsafe(
+            self._call_api_with_retry(messages, max_new_tokens),
+            self._loop,
+        )
+        return future.result()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join()
+
+
+def configure_openai_runtime(base_url, api_key, model, concurrency, timeout=600):
+    """Create the process-wide runtime, replacing it only if config changed."""
+    if int(concurrency) < 1:
+        raise ValueError(f"concurrency must be a positive integer, got {concurrency!r}")
+
+    global _runtime
+    config = (str(base_url), api_key, model, int(concurrency), timeout)
+    with _runtime_lock:
+        if _runtime is not None and _runtime.config == config:
+            return
+        if _runtime is not None:
+            _runtime.close()
+        _runtime = _PersistentOpenAIRuntime(*config)
+
+
+def shutdown_openai_runtime():
+    """Close the persistent client and its event loop. Safe to call twice."""
+    global _runtime
+    with _runtime_lock:
+        if _runtime is not None:
+            _runtime.close()
+            _runtime = None
 
 
 def load_video(video_path, args):
@@ -89,60 +207,13 @@ def _frames_to_openai_content(video):
     return content
 
 
-async def _call_api_with_retry(messages, max_new_tokens):
-    """
-    Call the OpenAI-compatible API with exponential backoff.
-    Only the network call is retried; content preparation is excluded.
-
-    A fresh AsyncOpenAI client is created for each asyncio.run() invocation
-    to avoid "Event loop is closed" errors that occur when reusing a client
-    whose internal httpx connection pool was bound to a different event loop.
-    """
-    @retry(
-        retry=retry_if_exception_type((
-            openai.APIConnectionError,
-            openai.APITimeoutError,
-        )),
-        wait=wait_exponential(multiplier=1, min=2, max=60),
-        stop=stop_after_attempt(8),
-        before_sleep=before_sleep_log(_log, logging.WARNING),
-        reraise=True,
-    )
-    async def _do_call():
-        # Create a fresh client bound to the current event loop so httpx
-        # cleanup never touches a closed loop from a prior asyncio.run().
-        async with openai.AsyncOpenAI(
-            base_url=_base_url,
-            api_key=_api_key,
-        ) as client:
-            return await client.chat.completions.create(
-                model=model_version,
-                messages=messages,
-                max_tokens=max_new_tokens,
-                temperature=0.0,
-            )
-
-    response = await _do_call()
-    return response.choices[0].message.content or ""
-
-
-async def _async_mllm_response(text, video, max_new_tokens):
-    """Prepare content (once), then call the API with retry."""
-    if openai_client is None:
-        raise ValueError(
-            "[lmms_eval_async_openai] openai_client is not set. "
-            "Call vgent_adapter.init_vgent_instance() with an openai_client before use."
-        )
-
-    # ── Content preparation (not retried) ──────────────────────────────────
+def _prepare_messages(text, video):
+    """Encode request content once, outside the retried network call."""
     content = []
     if video is not None:
         content.extend(_frames_to_openai_content(video))
     content.append({"type": "text", "text": text})
-    messages = [{"role": "user", "content": content}]
-
-    # ── Retried API call ───────────────────────────────────────────────────
-    return await _call_api_with_retry(messages, max_new_tokens)
+    return [{"role": "user", "content": content}]
 
 
 def mllm_response(
@@ -157,13 +228,19 @@ def mllm_response(
     fps=None,
 ):
     """
-    Synchronous wrapper — Vgent's graph builder is synchronous, so we run the
-    coroutine with asyncio.run().  Because each call is independent and vLLM
-    serves them concurrently via HTTP, this achieves the same throughput as
-    the async path while keeping Vgent's synchronous call-sites unchanged.
+    Synchronous wrapper for Vgent's graph/retrieval code. The request itself is
+    submitted to the one persistent async runtime shared by all worker threads.
     """
     try:
-        return asyncio.run(_async_mllm_response(text, video, max_new_tokens))
+        with _runtime_lock:
+            runtime = _runtime
+        if runtime is None:
+            raise ValueError(
+                "[lmms_eval_async_openai] OpenAI runtime is not configured. "
+                "Call vgent_adapter.init_vgent_instance() first."
+            )
+        messages = _prepare_messages(text, video)
+        return runtime.request(messages, max_new_tokens)
     except Exception:
         import traceback
         traceback.print_exc()

@@ -5,6 +5,7 @@ import importlib
 import numpy as np
 import networkx as nx
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from transformers import AutoModel, AutoTokenizer
@@ -41,6 +42,13 @@ class Vgent():
         self.processor, self.video_llm, self.image_processor, _ = self.load_model(model_path)
         self.embedding_tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-large-en-v1.5')
         self.embedding_model = AutoModel.from_pretrained('BAAI/bge-large-en-v1.5')
+        self._graph_executor = ThreadPoolExecutor(
+            max_workers=max(1, int(getattr(self.args, "batch_size", 1))),
+            thread_name_prefix="vgent-graph",
+        )
+
+    def close(self):
+        self._graph_executor.shutdown(wait=True)
     
     def generate_entities(self, prompt, video_input, max_new_tokens=512):
         attempts = 0
@@ -70,8 +78,22 @@ class Vgent():
         split_video_inputs = torch.split(video_inputs[0], self.args.chunk_size, dim=0)
         video_graph = nx.DiGraph()
         entity_graph = defaultdict(set)
-        for idx, video_input in enumerate(split_video_inputs):
-            entities, actions, scenes = self.generate_entities(GRAPH_PROMPT, video_input, max_new_tokens=512)
+        # Entity extraction is the network-bound part. Submit every chunk to
+        # the shared executor; the OpenAI backend's process-wide semaphore is
+        # the authoritative BATCH_SIZE limit across all simultaneous graphs.
+        chunk_results = list(
+            self._graph_executor.map(
+                lambda video_input: self.generate_entities(
+                    GRAPH_PROMPT,
+                    video_input,
+                    max_new_tokens=512,
+                ),
+                split_video_inputs,
+            )
+        )
+        # Merge results in chunk order so graph construction stays deterministic
+        # and the embedding model is not mutated concurrently within a graph.
+        for idx, (entities, actions, scenes) in enumerate(chunk_results):
             if subtitles is not None:
                 start_time = idx * self.args.chunk_size // self.args.fps
                 end_time = (idx + 1) * self.args.chunk_size // self.args.fps
