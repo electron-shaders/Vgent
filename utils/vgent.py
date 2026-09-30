@@ -1,18 +1,27 @@
-import json
-import re
-import ast
 import importlib
-import numpy as np
-import networkx as nx
+import json
+import logging
+import re
+import threading
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 
+import networkx as nx
+import numpy as np
 import torch
-from transformers import AutoModel, AutoTokenizer
-
-from utils.prompts import *
-from utils.retrieval import compute_text_similarity, extract_choices, allocate_node, node2indices, count_and_sort_filtered
 from models.utils import resize_video
+from transformers import AutoModel, AutoTokenizer
+from utils.generation import VgentResponseTruncatedError, resolve_graph_token_budgets
+from utils.prompts import *
+from utils.retrieval import (
+    allocate_node,
+    compute_text_similarity,
+    count_and_sort_filtered,
+    extract_choices,
+    node2indices,
+)
+
+_log = logging.getLogger(__name__)
 
 MODEL_MAP = {
     "llava_video":    ("models.llavavideo", "lmms-lab/LLaVA-Video-7B-Qwen2"),
@@ -28,6 +37,12 @@ MODEL_MAP = {
 class Vgent():
     def __init__(self, args):
         self.args = args
+        self._cancelled = threading.Event()
+        args.graph_max_new_tokens, args.graph_max_new_tokens_limit = resolve_graph_token_budgets(
+            getattr(args, "graph_max_new_tokens", None),
+            getattr(args, "graph_max_new_tokens_limit", None),
+        )
+        _log.info("Vgent graph token budget: initial=%s, limit=%s", args.graph_max_new_tokens, args.graph_max_new_tokens_limit)
         module_name, model_path = next(
             ((module, model_path) for key, (module, model_path) in MODEL_MAP.items() if key in self.args.model_name),
             None
@@ -47,14 +62,30 @@ class Vgent():
             thread_name_prefix="vgent-graph",
         )
 
+    def raise_if_cancelled(self):
+        if self._cancelled.is_set():
+            raise CancelledError("Vgent evaluation was cancelled")
+
+    def cancel(self):
+        """Stop queued chunks; running chunks exit at cancellation checkpoints."""
+        self._cancelled.set()
+        self._graph_executor.shutdown(wait=False, cancel_futures=True)
+
     def close(self):
-        self._graph_executor.shutdown(wait=True)
+        self.cancel()
+        self._graph_executor.shutdown(wait=True, cancel_futures=True)
     
-    def generate_entities(self, prompt, video_input, max_new_tokens=512):
+    def generate_entities(self, prompt, video_input, max_new_tokens=None):
+        max_new_tokens, token_limit = resolve_graph_token_budgets(
+            max_new_tokens if max_new_tokens is not None else self.args.graph_max_new_tokens,
+            self.args.graph_max_new_tokens_limit,
+        )
         attempts = 0
         while attempts < 5:
+            self.raise_if_cancelled()
             try:
                 response = self.mllm_response(self.video_llm, self.processor, self.image_processor, prompt, None, video_input, max_new_tokens)
+                self.raise_if_cancelled()
                 info = json.loads(response.replace("```json", "").replace("```","").strip())
                 
                 entities = [f"{entity['entity name']}, {entity['description']}" 
@@ -68,13 +99,20 @@ class Vgent():
                 scenes = [scene["location"] for scene in info.get("scenes", []) if "location" in scene]
                 
                 return entities, actions, scenes
-            
+
+            except VgentResponseTruncatedError as exc:
+                if max_new_tokens >= token_limit:
+                    raise RuntimeError(f"Vgent graph entity extraction exhausted graph_max_new_tokens_limit={token_limit}") from exc
+                next_budget = min(max_new_tokens * 2, token_limit)
+                _log.warning("Vgent graph response truncated at %s tokens; retrying this chunk with %s (limit=%s)", max_new_tokens, next_budget, token_limit)
+                max_new_tokens = next_budget
             except (json.JSONDecodeError, KeyError, TypeError) as e:
                 attempts += 1
         
-        return [], [], []
+        raise RuntimeError("Vgent entity extraction did not return valid JSON after 5 attempts")
     
     def construct_graph(self, video_inputs, subtitles):
+        self.raise_if_cancelled()
         split_video_inputs = torch.split(video_inputs[0], self.args.chunk_size, dim=0)
         video_graph = nx.DiGraph()
         entity_graph = defaultdict(set)
@@ -86,7 +124,6 @@ class Vgent():
                 lambda video_input: self.generate_entities(
                     GRAPH_PROMPT,
                     video_input,
-                    max_new_tokens=512,
                 ),
                 split_video_inputs,
             )
@@ -94,6 +131,7 @@ class Vgent():
         # Merge results in chunk order so graph construction stays deterministic
         # and the embedding model is not mutated concurrently within a graph.
         for idx, (entities, actions, scenes) in enumerate(chunk_results):
+            self.raise_if_cancelled()
             if subtitles is not None:
                 start_time = idx * self.args.chunk_size // self.args.fps
                 end_time = (idx + 1) * self.args.chunk_size // self.args.fps
@@ -102,6 +140,7 @@ class Vgent():
                 current_subtitles = None
             video_graph.add_node(idx, actions=actions, scenes=scenes, entities=entities, subtitles=current_subtitles)
             for entity in entities + actions + scenes:
+                self.raise_if_cancelled()
                 entity_name = entity.split(',')[0].lower()
                 if len(entity_graph) == 0:
                     entity_graph[entity_name].add(idx)
@@ -234,7 +273,7 @@ class Vgent():
         retrieved_node_list["nodes"] = sorted_nodes
         return retrieved_node_list, info, check_result
     
-    def aggregate_nodes(self, refined_node_list, llm_info, video_inputs, raw_video, size_list, subtitles, prompt, query, video_graph, sql_check, check_result, fps):
+    def aggregate_nodes(self, refined_node_list, llm_info, video_inputs, raw_video, size_list, subtitles, prompt, query, video_graph, sql_check, check_result, fps, generation_kwargs=None, return_raw_response=False):
         question_type = llm_info["tool"] if llm_info is not None and "tool" in llm_info else None
         select_subtitles = None
         node_list = refined_node_list["nodes"]
@@ -301,13 +340,25 @@ class Vgent():
                 if len(video_segments) == 0:
                     video_segments = raw_video[0]
                 video_segments, fps = resize_video(video_segments, fps, total_pixels=self.args.total_pixels*28*28, maximum_frames=512)
-            output_text = self.mllm_response(self.video_llm, self.processor, self.image_processor, input_prompt, None, video_segments, max_new_tokens=10, size_list=input_size_list, fps=fps)
-            pred_answer = output_text.strip("()").strip()
-            if pred_answer in query['letters']:
-                pred_idx = query['letters'].index(pred_answer)
-            else:
-                # unmatched letter
-                pred_idx = 2
-            pred = query['letters'][pred_idx]
+            generation = dict(generation_kwargs or {})
+            max_new_tokens = int(generation.get("max_new_tokens", getattr(self.args, "max_new_tokens", 4096)))
+            if max_new_tokens < 1:
+                raise ValueError("max_new_tokens must be a positive integer")
+            api_options = {"generation_kwargs": generation, "return_raw_response": return_raw_response} if self.args.model_name == "lmms_eval_async_openai" else {}
+            output_text = self.mllm_response(self.video_llm, self.processor, self.image_processor, input_prompt, None, video_segments, max_new_tokens=max_new_tokens, size_list=input_size_list, fps=fps, **api_options)
+            # Parsing is diagnostic only for lmms-eval. Standalone callers keep
+            # the original parsed-answer contract and strict validation.
+            match = re.fullmatch(
+                r"(?:(?:the\s+)?(?:correct\s+)?answer\s*(?:is\s*|:\s*))?\(?([A-Za-z])\)?[.!]?",
+                output_text.strip() if isinstance(output_text, str) else "",
+                flags=re.IGNORECASE,
+            )
+            pred = match.group(1).upper() if match else None
+            if return_raw_response:
+                if pred not in query['letters']:
+                    _log.warning("Vgent final answer was not parseable; passing raw response to evaluator: %r", output_text[:200] if isinstance(output_text, str) else output_text)
+                return output_text if isinstance(output_text, str) else ""
+            if pred not in query['letters']:
+                raise RuntimeError(f"Vgent returned an invalid choice: {output_text[:160]!r}")
 
         return pred

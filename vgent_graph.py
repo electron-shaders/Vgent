@@ -9,6 +9,7 @@ import pysubs2
 import argparse
 from utils.data import EvalDatasetMLVU, EvalDatasetVideoMME, EvalDatasetLongVideoBench, get_subtitles
 from utils.vgent import Vgent
+from utils.generation import add_graph_generation_args, validate_graph_generation_args
 import pickle
 from torch import distributed as dist
 
@@ -23,7 +24,9 @@ parser.add_argument('--data_path', default="./data")
 parser.add_argument('--fps', type=float, default=1.0)
 parser.add_argument('--graph_path', type=str, default='./graphs')
 parser.add_argument('--total_pixels', type=int, default=16384)
+add_graph_generation_args(parser)
 args = parser.parse_args()
+validate_graph_generation_args(args, parser)
 
 dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=8))
 torch.distributed.barrier()

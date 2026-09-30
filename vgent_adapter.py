@@ -9,6 +9,7 @@ by interacting directly with the `Vgent` class and `utils`.
 import argparse
 import os
 import pickle
+import sys
 import tempfile
 import threading
 import warnings
@@ -82,8 +83,10 @@ def _save_graph_atomic(graph_path, video_graph, entity_graph):
 
 
 def _load_or_build_artifacts(vgent, video_path, subtitle_path, graph_path):
+    vgent.raise_if_cancelled()
     args = vgent.args
     raw_video, _, _, _, fps, video_inputs, size_list = vgent.load_video(video_path, args)
+    vgent.raise_if_cancelled()
     if "llava_video" in args.model_name:
         video = vgent.image_processor.preprocess(raw_video, return_tensors="pt")["pixel_values"].cuda().to(dtype=torch.bfloat16)
         video_inputs = [video]
@@ -109,8 +112,10 @@ def _load_or_build_artifacts(vgent, video_path, subtitle_path, graph_path):
                 stacklevel=2,
             )
         video_graph, entity_graph = vgent.construct_graph(video_inputs, subtitles)
+        vgent.raise_if_cancelled()
         _save_graph_atomic(graph_path, video_graph, entity_graph)
 
+    vgent.raise_if_cancelled()
     return _VideoArtifacts(
         raw_video=raw_video,
         fps=fps,
@@ -123,6 +128,7 @@ def _load_or_build_artifacts(vgent, video_path, subtitle_path, graph_path):
 
 
 def _acquire_video_artifacts(cache_key, vgent, video_path, subtitle_path, graph_path):
+    vgent.raise_if_cancelled()
     with _video_cache_lock:
         entry = _video_cache.get(cache_key)
         if entry is None:
@@ -131,7 +137,12 @@ def _acquire_video_artifacts(cache_key, vgent, video_path, subtitle_path, graph_
         entry.users += 1
 
     try:
-        with entry.lock:
+        # A query waiting for another query's decode/build must also be able
+        # to leave promptly when evaluation is cancelled.
+        while not entry.lock.acquire(timeout=0.1):
+            vgent.raise_if_cancelled()
+        try:
+            vgent.raise_if_cancelled()
             if entry.artifacts is None:
                 entry.artifacts = _load_or_build_artifacts(
                     vgent,
@@ -140,6 +151,8 @@ def _acquire_video_artifacts(cache_key, vgent, video_path, subtitle_path, graph_
                     graph_path,
                 )
             return entry, entry.artifacts
+        finally:
+            entry.lock.release()
     except BaseException:
         _release_video_artifacts(cache_key, entry)
         raise
@@ -162,6 +175,8 @@ def init_vgent_instance(
     openai_model_version: str = None,
     batch_size: int | None = None,
     openai_timeout: int = 600,
+    graph_max_new_tokens: int | None = None,
+    graph_max_new_tokens_limit: int | None = None,
 ):
     """
     Initialize the singleton Vgent instance on the main thread.
@@ -177,6 +192,9 @@ def init_vgent_instance(
         persistent OpenAI client.
     openai_model_version : str, optional
         Model name to use with the OpenAI client (e.g. "Qwen/Qwen3.5-4B").
+    graph_max_new_tokens, graph_max_new_tokens_limit : int, optional
+        Initial and maximum graph-chunk output budgets. When omitted, use
+        VGENT_GRAPH_MAX_NEW_TOKENS / VGENT_GRAPH_MAX_NEW_TOKENS_LIMIT, or 2048 / 16384.
     """
     global _vgent_instance
 
@@ -241,37 +259,62 @@ def init_vgent_instance(
             total_pixels=16384,
             fps=1.0,
             batch_size=batch_size,
+            graph_max_new_tokens=graph_max_new_tokens,
+            graph_max_new_tokens_limit=graph_max_new_tokens_limit,
         )
         _vgent_instance = Vgent(args)
         return _vgent_instance
+
+
+def cancel_vgent_instance():
+    """Non-blocking abort signal, safe before asyncio joins query workers.
+
+    Keep the cancelled singleton installed until those workers have exited;
+    otherwise an already queued query could initialize a fresh graph builder.
+    """
+    try:
+        if _vgent_instance is not None:
+            _vgent_instance.cancel()
+    finally:
+        # A native/local-model run may never have imported the API backend.
+        backend = sys.modules.get("models.lmms_eval_async_openai")
+        if backend is not None:
+            backend.cancel_openai_runtime()
 
 
 def shutdown_vgent_instance():
     """Release Vgent workers, cached videos, and the persistent API client."""
     global _vgent_instance
     with _vgent_init_lock:
-        if _vgent_instance is not None:
-            close = getattr(_vgent_instance, "close", None)
-            if close is not None:
-                close()
-            _vgent_instance = None
-        with _video_cache_lock:
-            _video_cache.clear()
-
         try:
-            import models.lmms_eval_async_openai as _m
-        except ImportError:
-            return
-        _m.shutdown_openai_runtime()
+            cancel_vgent_instance()
+        finally:
+            try:
+                # Release API waiters BEFORE joining the graph pool.
+                backend = sys.modules.get("models.lmms_eval_async_openai")
+                if backend is not None:
+                    backend.shutdown_openai_runtime()
+            finally:
+                try:
+                    if _vgent_instance is not None:
+                        _vgent_instance.close()
+                finally:
+                    _vgent_instance = None
+                    with _video_cache_lock:
+                        _video_cache.clear()
 
-def run_vgent_query(video_id: str, query: str, video_path: str, output_dir: str, question: str, candidates: list[str], doc: dict, subtitle_path: str | None = None, model_name: str = "qwenvl25_7b", task: str = "custom") -> str:
+def run_vgent_query(video_id: str, query: str, video_path: str, output_dir: str, question: str, candidates: list[str], doc: dict, subtitle_path: str | None = None, model_name: str = "qwenvl25_7b", task: str = "custom", generation_kwargs: dict | None = None, return_raw_response: bool = False) -> str:
     """
     Run Vgent text-based retrieval for one query.
     Extracts the textual context of the top-k clips from the pre-built graph.
+    Set return_raw_response for lmms-eval: only its task parser grades the final
+    model output; Vgent's final-answer parsing becomes diagnostic only.
     """
     vgent = init_vgent_instance(model_name, task)
+    vgent.raise_if_cancelled()
     args = vgent.args
     _lazy_init_embeddings()
+    vgent.raise_if_cancelled()
 
     prompt = f"Question: {question}\n"
     prompt += "Options:\n"
@@ -297,13 +340,15 @@ def run_vgent_query(video_id: str, query: str, video_path: str, output_dir: str,
         subtitles = artifacts.subtitles
         video_graph = artifacts.video_graph
         entity_graph = artifacts.entity_graph
+        vgent.raise_if_cancelled()
         query_list, llm_info = vgent.extract_keywords(question, candidates, video_inputs)
+        vgent.raise_if_cancelled()
         retrieved_node_list = vgent.retrieve_nodes(question, query_list, video_inputs, candidates, video_graph, entity_graph, subtitles, llm_info)
+        vgent.raise_if_cancelled()
         refined_node_list, sql_check, check_result = vgent.refine_nodes(retrieved_node_list, question, llm_info, candidates, video_inputs, subtitles, size_list)
-        pred = vgent.aggregate_nodes(refined_node_list, llm_info, video_inputs, raw_video, size_list, subtitles, prompt, doc, video_graph, sql_check, check_result, fps)
-    except Exception as exc:
-        warnings.warn(f"[vgent_adapter] Query failed: {exc}", RuntimeWarning, stacklevel=2)
-        return ""
+        vgent.raise_if_cancelled()
+        pred = vgent.aggregate_nodes(refined_node_list, llm_info, video_inputs, raw_video, size_list, subtitles, prompt, doc, video_graph, sql_check, check_result, fps, generation_kwargs=generation_kwargs, return_raw_response=return_raw_response)
+        vgent.raise_if_cancelled()
     finally:
         _release_video_artifacts(cache_key, cache_entry)
 

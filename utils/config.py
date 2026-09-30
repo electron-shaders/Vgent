@@ -1,5 +1,8 @@
 import argparse
 
+from utils.generation import add_graph_generation_args, validate_graph_generation_args
+
+
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -15,9 +18,14 @@ def get_args():
     parser.add_argument('--fps', type=float, default=1.0)
     parser.add_argument('--graph_path', type=str, default='./graphs')
     parser.add_argument('--total_pixels', type=int, default=16384)
+    parser.add_argument('--max_new_tokens', type=int, default=4096, help='Maximum generated tokens for the final answer (including reasoning).')
+    add_graph_generation_args(parser)
     parser.add_argument('--duration', default="long,medium,short", type=str)
 
     args = parser.parse_args()
+    if args.max_new_tokens < 1:
+        parser.error('--max_new_tokens must be a positive integer')
+    validate_graph_generation_args(args, parser)
     args.duration = args.duration.split(",")
 
     return args
