@@ -22,6 +22,8 @@ from concurrent.futures import CancelledError
 import numpy as np
 import openai
 import torch
+from lmms_eval.models.model_utils.concurrency_control import parse_bool
+from lmms_eval.models.model_utils.qwen35_sampling import qwen35_generation_kwargs
 from models.utils import fetch_video, resize_video
 from PIL import Image
 from tenacity import (
@@ -123,22 +125,40 @@ class _PersistentOpenAIRuntime:
         # Only the final answer may use reasoning. Structured helper calls need
         # their token allowance for JSON, not a hidden reasoning response.
         generation = dict(generation_kwargs or {})
+        generation = qwen35_generation_kwargs(self.model, generation, enable_thinking=generation_kwargs is not None)
+        extra_body = dict(generation.get("extra_body") or {})
+        chat_template_kwargs = dict(extra_body.get("chat_template_kwargs") or {})
+        enable_thinking = generation_kwargs is not None and parse_bool(
+            chat_template_kwargs.get("enable_thinking", generation.get("enable_thinking", True))
+        )
         api_kwargs = {"temperature": generation.get("temperature", 0.0)}
-        if "top_p" in generation:
-            api_kwargs["top_p"] = generation["top_p"]
+        for key in ("top_p", "presence_penalty", "frequency_penalty", "seed"):
+            if key in generation:
+                api_kwargs[key] = generation[key]
+        for key in ("top_k", "min_p", "repetition_penalty"):
+            if key in generation:
+                extra_body[key] = generation[key]
         if "qwen3" in self.model.lower():
-            enable_thinking = generation_kwargs is not None
-            api_kwargs["extra_body"] = {
-                "chat_template_kwargs": {"enable_thinking": enable_thinking},
+            extra_body["chat_template_kwargs"] = {
+                **chat_template_kwargs,
+                "enable_thinking": enable_thinking,
             }
             if enable_thinking and "thinking_token_budget" in generation:
-                api_kwargs["extra_body"]["thinking_token_budget"] = generation["thinking_token_budget"]
+                extra_body["thinking_token_budget"] = generation["thinking_token_budget"]
+            elif not enable_thinking:
+                extra_body.pop("thinking_token_budget", None)
+        if extra_body:
+            api_kwargs["extra_body"] = extra_body
         if return_raw_response:
             max_new_tokens = int(max_new_tokens)
             if max_new_tokens < 1:
                 raise ValueError("max_new_tokens must be a positive integer")
             if max_new_tokens > self.final_token_limit:
-                _log.warning("Clamping Vgent final max_new_tokens=%s to VGENT_TRUNCATION_MAX_TOKENS=%s", max_new_tokens, self.final_token_limit)
+                _log.warning(
+                    "Clamping Vgent final max_new_tokens=%s to VGENT_TRUNCATION_MAX_TOKENS=%s",
+                    max_new_tokens,
+                    self.final_token_limit,
+                )
             max_new_tokens = min(max_new_tokens, self.final_token_limit)
 
         @retry(
