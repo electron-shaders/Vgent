@@ -313,7 +313,7 @@ class Vgent():
         else:
             input_prompt = prompt
         
-        if question_type == "action counting" and node_list is not None and (None not in [re.search(r'\d+', c) for c in query['candidates']]):
+        if question_type == "action counting" and node_list is not None and query['candidates'] and (None not in [re.search(r'\d+', c) for c in query['candidates']]):
             numbers = [int(re.search(r'\d+', c).group()) for c in query['candidates']]
             pred_idx = min(range(len(numbers)), key=lambda i: abs(numbers[i] - len(node_list)))
             pred = query['letters'][pred_idx]
@@ -333,7 +333,12 @@ class Vgent():
                     agg_info = self.mllm_response(self.video_llm, self.processor, self.image_processor, input_text, None, None, 128)
                 except:
                     agg_info = None
-            input_prompt = input_prompt + PRED_PROMPT + agg_info if agg_info is not None else input_prompt + PRED_PROMPT
+            # lmms-eval supplies the task's prompt, which may require numeric
+            # indices or an open answer instead of a letter.
+            if not return_raw_response:
+                input_prompt += PRED_PROMPT
+            if agg_info is not None:
+                input_prompt += agg_info
             if "qwenvl" in self.args.model_name or self.args.model_name == "lmms_eval_async_openai":
                 # qwenvl support dynamic resolution
                 video_segments = raw_video[0][indices]
@@ -349,13 +354,13 @@ class Vgent():
             # Parsing is diagnostic only for lmms-eval. Standalone callers keep
             # the original parsed-answer contract and strict validation.
             match = re.fullmatch(
-                r"(?:(?:the\s+)?(?:correct\s+)?answer\s*(?:is\s*|:\s*))?\(?([A-Za-z])\)?[.!]?",
+                r"(?:(?:the\s+)?(?:correct\s+)?answer\s*(?:is\s*|:\s*))?\(?([A-Za-z]|\d+)\)?[.!]?",
                 output_text.strip() if isinstance(output_text, str) else "",
                 flags=re.IGNORECASE,
             )
             pred = match.group(1).upper() if match else None
             if return_raw_response:
-                if pred not in query['letters']:
+                if query['letters'] and pred not in query['letters']:
                     _log.warning("Vgent final answer was not parseable; passing raw response to evaluator: %r", output_text[:200] if isinstance(output_text, str) else output_text)
                 return output_text if isinstance(output_text, str) else ""
             if pred not in query['letters']:

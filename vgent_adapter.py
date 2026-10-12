@@ -320,6 +320,9 @@ def run_vgent_query(video_id: str, query: str, video_path: str, output_dir: str,
     prompt += "Options:\n"
     for op in candidates:
         prompt += f"{op}\n"
+    if return_raw_response:
+        # The evaluator owns choice labels, subtitles, and answer formatting.
+        prompt = query
 
     os.makedirs(output_dir, exist_ok=True)
     graph_path = os.path.join(output_dir, "graph.pkl")
