@@ -23,7 +23,7 @@ import numpy as np
 import openai
 import torch
 from lmms_eval.models.model_utils.concurrency_control import parse_bool
-from lmms_eval.models.model_utils.qwen35_sampling import qwen35_generation_kwargs
+from lmms_eval.models.model_utils.qwen35_38_sampling import qwen_generation_kwargs
 from models.utils import fetch_video, resize_video
 from PIL import Image
 from tenacity import (
@@ -125,7 +125,7 @@ class _PersistentOpenAIRuntime:
         # Only the final answer may use reasoning. Structured helper calls need
         # their token allowance for JSON, not a hidden reasoning response.
         generation = dict(generation_kwargs or {})
-        generation = qwen35_generation_kwargs(self.model, generation, enable_thinking=generation_kwargs is not None)
+        generation = qwen_generation_kwargs(self.model, generation, enable_thinking=generation_kwargs is not None)
         extra_body = dict(generation.get("extra_body") or {})
         chat_template_kwargs = dict(extra_body.get("chat_template_kwargs") or {})
         enable_thinking = generation_kwargs is not None and parse_bool(
